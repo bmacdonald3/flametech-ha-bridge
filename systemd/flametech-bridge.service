@@ -1,0 +1,16 @@
+[Unit]
+Description=FlameTech BLE -> MQTT bridge
+After=network-online.target bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bmacdonald3
+WorkingDirectory=/home/bmacdonald3
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/bmacdonald3/flametech-ha-bridge/src/flametech_mqtt_bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
