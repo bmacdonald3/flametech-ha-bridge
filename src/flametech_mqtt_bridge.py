@@ -1,183 +1,362 @@
-#!/usr/bin/env python3
-import asyncio
-import json
-import time
-from datetime import datetime, timezone
+import boto3, json, time, threading
+from flask import Flask, jsonify, request
+from pycognito import Cognito
+from awsiot import mqtt_connection_builder
+from awscrt import mqtt as awsmqtt, auth
+import paho.mqtt.client as paho_mqtt
+import logging
 
-from bleak import BleakClient, BleakScanner
-import paho.mqtt.client as mqtt
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("iflame")
 
-# ====== CONFIG ======
-ADDR = "EC:64:C9:0F:DC:2A"
+# ── AWS Config ──
+POOL_ID = "us-east-1_xCzWPPECR"
+CLIENT_ID = "REDACTED"
+CLIENT_SECRET = "REDACTED"
+IDENTITY_POOL = "REDACTED"
+IOT_EP = "REDACTED"
+R = "us-east-1"
+THING = "RFF-10FDC28"
+EMAIL = "REDACTED"
+IFLAME_PW = "REDACTED"
 
-# GATT chars
-AA = "0000aa01-0000-1000-8000-00805f9b34fb"
-BB = "0000bb01-0000-1000-8000-00805f9b34fb"
-CC = "0000cc01-0000-1000-8000-00805f9b34fb"
-DD = "0000dd01-0000-1000-8000-00805f9b34fb"
+# ── HA MQTT Config ──
+HA_MQTT_HOST = "192.168.42.5"
+HA_MQTT_PORT = 1883
+HA_MQTT_USER = "REDACTED"
+HA_MQTT_PASS = "REDACTED_MQTT"
+TOPIC_STATE = "fireplace/status"
+TOPIC_CMD = "fireplace/set"
+TOPIC_AVAIL = "fireplace/available"
+TOPIC_CLIMATE_MODE_CMD = "fireplace/climate/mode/set"
+TOPIC_CLIMATE_TEMP_CMD = "fireplace/climate/temp/set"
+TOPIC_CLIMATE_STATE = "fireplace/climate/state"
 
-# MQTT (HA Mosquitto)
-MQTT_HOST = "192.168.42.5"
-MQTT_PORT = 1883
-MQTT_USER = "REDACTED"       # <-- set to None if not needed
-MQTT_PASS = "REDACTED_MQTT"         # <-- set to None if not needed
+app = Flask(__name__)
+creds = None
+creds_expire = 0
+iot_session = None
+ha_mqtt = None
 
-# Topics
-TOPIC_STATE = "flametech/hub/dd"
-TOPIC_HEARTBEAT = "flametech/hub/last_seen"
+# ═══════════════════════════════════════════════════════════════════════════════
+# AWS Auth & IoT
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# HA discovery base
-DISCOVERY_PREFIX = "homeassistant"
-DEVICE_ID = "flametech_hub_ec64c90fdc2a"
-DEVICE_META = {
-    "identifiers": [DEVICE_ID],
-    "name": "FlameTech Hub",
-    "manufacturer": "FlameTech",
-    "model": "Hub",
-}
+def refresh_creds():
+    global creds, creds_expire, iot_session
+    log.info("Refreshing AWS credentials...")
+    u = Cognito(POOL_ID, CLIENT_ID, client_secret=CLIENT_SECRET, username=EMAIL)
+    u.authenticate(password=IFLAME_PW)
+    ic = boto3.client("cognito-identity", region_name=R)
+    lk = f"cognito-idp.{R}.amazonaws.com/{POOL_ID}"
+    iid = ic.get_id(IdentityPoolId=IDENTITY_POOL, Logins={lk: u.id_token})["IdentityId"]
+    cr = ic.get_credentials_for_identity(IdentityId=iid, Logins={lk: u.id_token})["Credentials"]
+    creds = cr
+    creds_expire = time.time() + 3000
+    iot_session = boto3.Session(
+        aws_access_key_id=cr["AccessKeyId"],
+        aws_secret_access_key=cr["SecretKey"],
+        aws_session_token=cr["SessionToken"],
+        region_name=R
+    )
+    try:
+        iot_session.client("iot").attach_policy(policyName="WiFi-Hub-Policy", target=iid)
+    except:
+        pass
+    log.info("AWS credentials refreshed")
 
-# Polling / reconnect behavior
-POLL_SECONDS = 5.0
-SCAN_TIMEOUT = 8.0
+def get_shadow():
+    if time.time() > creds_expire:
+        refresh_creds()
+    iot_data = iot_session.client("iot-data", endpoint_url=f"https://{IOT_EP}")
+    shadow = iot_data.get_thing_shadow(thingName=THING)
+    return json.loads(shadow["payload"].read())
 
+def aws_publish(payload_dict):
+    if time.time() > creds_expire:
+        refresh_creds()
+    cp = auth.AwsCredentialsProvider.new_static(
+        access_key_id=creds["AccessKeyId"],
+        secret_access_key=creds["SecretKey"],
+        session_token=creds["SessionToken"]
+    )
+    conn = mqtt_connection_builder.websockets_with_default_aws_signing(
+        endpoint=IOT_EP, region=R, credentials_provider=cp,
+        client_id=f"ha-iflame-{int(time.time())}", clean_session=True,
+    )
+    conn.connect().result(timeout=10)
+    conn.publish(
+        topic=f"$aws/things/{THING}/shadow/update",
+        payload=json.dumps(payload_dict),
+        qos=awsmqtt.QoS.AT_LEAST_ONCE
+    )
+    time.sleep(2)
+    conn.disconnect().result()
 
-def log(msg: str):
-    print(msg, flush=True)
+def next_cid():
+    shadow = get_shadow()
+    return str(int(shadow["state"]["desired"]["CID"]) + 1)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shadow → State Parser
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def iso_utc_now() -> str:
-    # HA timestamp sensor expects ISO8601
-    return datetime.now(timezone.utc).isoformat()
+def parse_shadow(shadow):
+    d = shadow["state"]["desired"]
+    r = shadow["state"]["reported"]
+    at = float(r["AT"])
+    st1 = r.get("ST1", 0)
+    cmd = d.get("CMD_LST", {}).get("CMD_steps", [{}])[0].get("C", "")
+    parts = cmd.split(":") if cmd else []
 
+    if len(parts) == 6:
+        mode = "smart"
+        set_temp = int(parts[3])
+        is_on = set_temp > at
+    elif len(parts) == 5:
+        mode = "simple"
+        set_temp = int(parts[3]) - 120
+        is_on = set_temp > at
+    else:
+        mode = "unknown"
+        set_temp = 0
+        is_on = False
 
-def mqtt_client() -> mqtt.Client:
-    c = mqtt.Client()
-    if MQTT_USER:
-        c.username_pw_set(MQTT_USER, MQTT_PASS or "")
-    c.connect(MQTT_HOST, MQTT_PORT, 60)
-    c.loop_start()
-    return c
-
-
-def publish_discovery(m: mqtt.Client):
-    # Ambient Temp
-    at = {
-        "name": "FlameTech Ambient Temp",
-        "uniq_id": "flametech_hub_at",
-        "stat_t": TOPIC_STATE,
-        "val_tpl": "{{ value_json.AT }}",
-        "unit_of_meas": "°F",
-        "dev_cla": "temperature",
-        "dev": DEVICE_META,
+    return {
+        "is_on": is_on,
+        "mode": mode,
+        "AT": round(at, 1),
+        "set_temp": set_temp,
+        "ST1": st1,
+        "ST2": r.get("ST2", 0),
+        "ST3": r.get("ST3", 0),
+        "ST4": r.get("ST4", 0),
+        "ST5": r.get("ST5", 0),
+        "cid": d.get("CID"),
+        "cmd": cmd,
     }
-    m.publish(f"{DISCOVERY_PREFIX}/sensor/flametech_hub/at/config",
-              json.dumps(at), retain=True)
 
-    # ST1..ST5, fw
-    for k in ["ST1", "ST2", "ST3", "ST4", "ST5", "fw"]:
-        cfg = {
-            "name": f"FlameTech {k}",
-            "uniq_id": f"flametech_hub_{k.lower()}",
-            "stat_t": TOPIC_STATE,
-            "val_tpl": f"{{{{ value_json.{k} }}}}",
-            "dev": DEVICE_META,
-        }
-        m.publish(f"{DISCOVERY_PREFIX}/sensor/flametech_hub/{k.lower()}/config",
-                  json.dumps(cfg), retain=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Fireplace Commands
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # Heartbeat (Last Seen)
-    heartbeat_config = {
-        "name": "FlameTech Last Seen",
-        "uniq_id": "flametech_hub_last_seen",
-        "stat_t": TOPIC_HEARTBEAT,
-        "dev_cla": "timestamp",
-        "icon": "mdi:clock-check",
-        "dev": DEVICE_META,
+def do_on():
+    cid = next_cid()
+    cmd = "2:0:1:193:203"
+    aws_publish({"state": {"desired": {"CID": cid, "CMD_LST": {"CMD_steps": [{"C": cmd, "D": 0.2}]}}}})
+    log.info(f"ON: CID={cid}")
+    poll_and_publish()
+    return {"ok": True, "cid": cid, "cmd": cmd}
+
+def do_off():
+    cid = next_cid()
+    cmd = "2:0:1:192:203"
+    aws_publish({"state": {"desired": {"CID": cid, "CMD_LST": {"CMD_steps": [{"C": cmd, "D": 0.2}]}}}})
+    log.info(f"OFF: CID={cid}")
+    poll_and_publish()
+    return {"ok": True, "cid": cid, "cmd": cmd}
+
+def do_smart(temp):
+    cid = next_cid()
+    cmd = f"2:2:1:{temp}:193:203"
+    aws_publish({"state": {"desired": {"CID": cid, "CMD_LST": {"CMD_steps": [{"C": cmd, "D": 0.2}]}}}})
+    log.info(f"SMART {temp}F: CID={cid}")
+    poll_and_publish()
+    return {"ok": True, "cid": cid, "cmd": cmd, "target_temp": temp}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HA MQTT Bridge
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup_ha_mqtt():
+    global ha_mqtt
+    ha_mqtt = paho_mqtt.Client(paho_mqtt.CallbackAPIVersion.VERSION2, client_id="iflame-bridge")
+    ha_mqtt.username_pw_set(HA_MQTT_USER, HA_MQTT_PASS)
+    ha_mqtt.will_set(TOPIC_AVAIL, "offline", retain=True)
+    ha_mqtt.on_connect = on_ha_connect
+    ha_mqtt.on_message = on_ha_message
+    ha_mqtt.connect(HA_MQTT_HOST, HA_MQTT_PORT)
+    ha_mqtt.loop_start()
+
+def on_ha_connect(client, userdata, flags, rc, properties=None):
+    log.info(f"HA MQTT connected rc={rc}")
+    client.publish(TOPIC_AVAIL, "online", retain=True)
+    client.subscribe(TOPIC_CMD)
+    client.subscribe(TOPIC_CLIMATE_MODE_CMD)
+    client.subscribe(TOPIC_CLIMATE_TEMP_CMD)
+    publish_discovery()
+
+def on_ha_message(client, userdata, msg):
+    payload = msg.payload.decode()
+    topic = msg.topic
+    log.info(f"HA command on {topic}: {payload}")
+    try:
+        if topic == TOPIC_CMD:
+            # Simple switch
+            if payload == "ON":
+                do_on()
+            elif payload == "OFF":
+                do_off()
+        elif topic == TOPIC_CLIMATE_MODE_CMD:
+            # Climate mode: off, heat
+            if payload == "off":
+                do_off()
+            elif payload == "heat":
+                # Turn on smart mode at last known set temp or 73
+                shadow = get_shadow()
+                st1 = shadow["state"]["reported"].get("ST1", 0)
+                temp = st1 if st1 > 60 else 73
+                do_smart(temp)
+        elif topic == TOPIC_CLIMATE_TEMP_CMD:
+            # Climate temp set
+            temp = int(float(payload))
+            do_smart(temp)
+    except Exception as e:
+        log.error(f"Command failed: {e}")
+
+def publish_discovery():
+    dev = {
+        "identifiers": ["iflame_rff_10fdc28"],
+        "name": "iFlame Fireplace",
+        "manufacturer": "iFlame / Girard",
+        "model": "RFF-10FDC28",
+        "sw_version": "13.00"
     }
-    m.publish(f"{DISCOVERY_PREFIX}/sensor/flametech_hub/last_seen/config",
-              json.dumps(heartbeat_config), retain=True)
 
-    log("Published MQTT discovery configs.")
+    # Switch (simple on/off)
+    ha_mqtt.publish("homeassistant/switch/iflame_fireplace/config", json.dumps({
+        "name": "Fireplace",
+        "unique_id": "iflame_fireplace_switch",
+        "command_topic": TOPIC_CMD,
+        "state_topic": TOPIC_STATE,
+        "value_template": "{{ 'ON' if value_json.is_on else 'OFF' }}",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "availability_topic": TOPIC_AVAIL,
+        "icon": "mdi:fireplace",
+        "device": dev,
+    }), retain=True)
 
+    # Climate (smart thermostat)
+    ha_mqtt.publish("homeassistant/climate/iflame_thermostat/config", json.dumps({
+        "name": "Fireplace Thermostat",
+        "unique_id": "iflame_fireplace_thermostat",
+        "modes": ["off", "heat"],
+        "mode_command_topic": TOPIC_CLIMATE_MODE_CMD,
+        "mode_state_topic": TOPIC_CLIMATE_STATE,
+        "mode_state_template": "{{ value_json.mode }}",
+        "temperature_command_topic": TOPIC_CLIMATE_TEMP_CMD,
+        "temperature_state_topic": TOPIC_CLIMATE_STATE,
+        "temperature_state_template": "{{ value_json.target_temp }}",
+        "current_temperature_topic": TOPIC_CLIMATE_STATE,
+        "current_temperature_template": "{{ value_json.current_temp }}",
+        "min_temp": 60,
+        "max_temp": 83,
+        "temp_step": 1,
+        "temperature_unit": "F",
+        "availability_topic": TOPIC_AVAIL,
+        "icon": "mdi:fireplace",
+        "device": dev,
+    }), retain=True)
 
-def publish_state(m: mqtt.Client, dd: dict):
-    payload = json.dumps(dd)
-    rc = m.publish(TOPIC_STATE, payload, retain=True).rc
-    log(f"MQTT publish rc={rc} topic={TOPIC_STATE} payload={payload}")
+    # Ambient temp sensor
+    ha_mqtt.publish("homeassistant/sensor/iflame_ambient_temp/config", json.dumps({
+        "name": "Fireplace Temperature",
+        "unique_id": "iflame_ambient_temp",
+        "state_topic": TOPIC_STATE,
+        "value_template": "{{ value_json.AT }}",
+        "unit_of_measurement": "\u00b0F",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "availability_topic": TOPIC_AVAIL,
+        "device": dev,
+    }), retain=True)
 
+    # Mode sensor
+    ha_mqtt.publish("homeassistant/sensor/iflame_mode/config", json.dumps({
+        "name": "Fireplace Mode",
+        "unique_id": "iflame_mode",
+        "state_topic": TOPIC_STATE,
+        "value_template": "{{ value_json.mode }}",
+        "availability_topic": TOPIC_AVAIL,
+        "icon": "mdi:fire",
+        "device": dev,
+    }), retain=True)
 
-def publish_heartbeat(m: mqtt.Client):
-    ts = iso_utc_now()
-    rc = m.publish(TOPIC_HEARTBEAT, ts, retain=True).rc
-    log(f"MQTT publish rc={rc} topic={TOPIC_HEARTBEAT} payload={ts}")
+    log.info("MQTT discovery published")
 
+def publish_state(state):
+    """Publish to both switch state and climate state topics."""
+    if not ha_mqtt:
+        return
+    ha_mqtt.publish(TOPIC_STATE, json.dumps(state), retain=True)
 
-def parse_dd(raw: bytes) -> dict:
-    # DD looks like JSON with a trailing null byte
-    s = raw.decode(errors="ignore").strip("\x00").strip()
-    if not s:
-        return {}
-    return json.loads(s)
+    # Climate state
+    climate = {
+        "mode": "heat" if state["mode"] == "smart" else ("heat" if state["is_on"] else "off"),
+        "target_temp": state["set_temp"],
+        "current_temp": state["AT"],
+    }
+    ha_mqtt.publish(TOPIC_CLIMATE_STATE, json.dumps(climate), retain=True)
 
+def poll_and_publish():
+    try:
+        shadow = get_shadow()
+        state = parse_shadow(shadow)
+        publish_state(state)
+    except Exception as e:
+        log.error(f"Poll failed: {e}")
 
-async def find_device(timeout: float):
-    devs = await BleakScanner.discover(timeout=timeout)
-    for d in devs:
-        if d.address.upper() == ADDR.upper():
-            return d
-    return None
-
-
-async def run_bridge():
-    m = mqtt_client()
-    publish_discovery(m)
-
-    backoff = 2.0
+def poll_loop():
     while True:
         try:
-            log("Scanning for hub...")
-            dev = await find_device(SCAN_TIMEOUT)
-            if not dev:
-                log(f"Not found. Sleeping {backoff:.1f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.6, 30.0)
-                continue
-
-            log(f"Found: {dev.address} name={dev.name!r}")
-            backoff = 2.0
-
-            log("Connecting...")
-            async with BleakClient(dev, timeout=20.0) as client:
-                log("Connected. Polling DD...")
-
-                while True:
-                    # Heartbeat every cycle no matter what
-                    publish_heartbeat(m)
-
-                    try:
-                        raw = await client.read_gatt_char(DD)
-                        dd = parse_dd(raw)
-                        if dd:
-                            publish_state(m, dd)
-                            log(f"{time.strftime('%H:%M:%S')} DD: {dd}")
-                        else:
-                            log("DD empty/invalid (no publish).")
-                    except Exception as e:
-                        log(f"DD read failed: {e!r}")
-
-                    await asyncio.sleep(POLL_SECONDS)
-
+            poll_and_publish()
         except Exception as e:
-            log(f"ERR: {e}")
-            log(f"Reconnect sleep {backoff:.1f}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.6, 30.0)
+            log.error(f"Poll loop error: {e}")
+        time.sleep(30)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flask REST API
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    log("Starting FlameTech MQTT bridge (persistent connect + poll)...")
-    asyncio.run(run_bridge())
+@app.route("/status")
+def status():
+    try:
+        shadow = get_shadow()
+        return jsonify(parse_shadow(shadow))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+@app.route("/on", methods=["POST"])
+def turn_on():
+    try:
+        return jsonify(do_on())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/off", methods=["POST"])
+def turn_off():
+    try:
+        return jsonify(do_off())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/smart", methods=["POST"])
+def smart_mode():
+    try:
+        temp = int(request.json.get("temp", 73))
+        return jsonify(do_smart(temp))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    main()
+    refresh_creds()
+    setup_ha_mqtt()
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+    log.info("iFlame API + MQTT bridge starting on port 5088")
+    app.run(host="0.0.0.0", port=5088)

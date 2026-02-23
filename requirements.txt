@@ -1,2 +1,5 @@
-bleak
+boto3
+pycognito
 paho-mqtt
+awsiotsdk
+flask

@@ -1,0 +1,71 @@
+type: custom:button-card
+entity: switch.iflame_fireplace_fireplace
+name: Fireplace
+grid_options:
+  rows: 2
+  columns: 4
+show_label: true
+tap_action:
+  action: more-info
+  entity: climate.iflame_fireplace_fireplace_thermostat
+icon: |
+  [[[
+    return (entity?.state === 'on') ? 'mdi:fireplace' : 'mdi:fireplace-off';
+  ]]]
+label: |
+  [[[
+    var sw = entity?.state;
+    var at = states['sensor.iflame_fireplace_fireplace_temperature']?.state;
+    var mode = states['sensor.iflame_fireplace_fireplace_mode']?.state;
+    var climate = states['climate.iflame_fireplace_fireplace_thermostat'];
+    var setTemp = climate?.attributes?.temperature;
+    var current = (at && at !== 'unknown' && at !== 'unavailable') ? Math.round(parseFloat(at)) : '--';
+    var target = (setTemp !== undefined && setTemp !== null) ? Math.round(setTemp) : '--';
+    var status;
+    if (sw === 'off') status = 'Off';
+    else if (mode === 'smart') status = 'Smart';
+    else status = 'On';
+    return status + ' • ' + current + '/' + target + '°';
+  ]]]
+styles:
+  card:
+    - height: 115px
+    - padding: 12px
+    - border-radius: 10px
+    - border: 2px solid
+    - transition: all 0.3s ease
+    - background: |
+        [[[
+          return (entity?.state === 'on') ? 'rgba(200, 100, 0, 0.22)' : 'var(--card-background-color)';
+        ]]]
+    - border-color: |
+        [[[
+          return (entity?.state === 'on') ? 'rgba(255, 140, 0, 0.95)' : 'transparent';
+        ]]]
+    - box-shadow: |
+        [[[
+          return (entity?.state === 'on') ? '0 0 14px 3px rgba(255, 120, 0, 0.5)' : 'none';
+        ]]]
+  icon:
+    - color: |
+        [[[
+          return (entity?.state === 'on') ? 'rgb(255, 140, 30)' : 'var(--disabled-text-color)';
+        ]]]
+    - filter: |
+        [[[
+          return (entity?.state === 'on')
+            ? 'drop-shadow(0 0 3px rgba(255,120,0,0.8)) drop-shadow(0 0 6px rgba(255,120,0,0.5))'
+            : 'none';
+        ]]]
+    - animation: |
+        [[[
+          return (entity?.state === 'on') ? 'flicker 2s ease-in-out infinite' : 'none';
+        ]]]
+extra_styles: |
+  @keyframes flicker {
+    0%   { transform: scale(1.00); filter: drop-shadow(0 0 2px rgba(255,120,0,0.8)); }
+    25%  { transform: scale(1.04); filter: drop-shadow(0 0 5px rgba(255,120,0,0.9)); }
+    50%  { transform: scale(1.06); filter: drop-shadow(0 0 8px rgba(255,120,0,0.6)); }
+    75%  { transform: scale(1.03); filter: drop-shadow(0 0 4px rgba(255,120,0,0.85)); }
+    100% { transform: scale(1.00); filter: drop-shadow(0 0 2px rgba(255,120,0,0.8)); }
+  }

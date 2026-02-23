@@ -1,19 +1,6 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-
-# OS/editor
-.DS_Store
-*.swp
-*.swo
-.vscode/
-.idea/
-
-# Logs/state
+*.pyc
+.env
 *.log
-state/
+venv/
+.vscode/

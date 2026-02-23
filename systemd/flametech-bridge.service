@@ -1,22 +1,16 @@
-# /etc/systemd/system/flametech-bridge.service
 [Unit]
-Description=FlameTech BLE -> MQTT bridge
-After=network-online.target bluetooth.service
+Description=FlameTech iFlame MQTT Bridge for Home Assistant
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=bmacdonald3
 WorkingDirectory=/home/bmacdonald3
-Environment=PYTHONUNBUFFERED=1
-
-# Reset adapter state (non-fatal). These work unprivileged in your setup.
-ExecStartPre=-/usr/bin/bluetoothctl power off
-ExecStartPre=-/usr/bin/bluetoothctl power on
-
 ExecStart=/usr/bin/python3 /home/bmacdonald3/flametech-ha-bridge/src/flametech_mqtt_bridge.py
 Restart=always
 RestartSec=10
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
