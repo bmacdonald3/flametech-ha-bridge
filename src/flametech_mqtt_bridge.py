@@ -202,15 +202,19 @@ def on_ha_message(client, userdata, msg):
             if payload == "off":
                 do_off()
             elif payload == "heat":
-                # Turn on smart mode at last known set temp or 73
-                shadow = get_shadow()
-                st1 = shadow["state"]["reported"].get("ST1", 0)
-                temp = st1 if st1 > 60 else 73
-                do_smart(temp)
+                do_on()
+                log.info("Heat mode: sent simple ON")
         elif topic == TOPIC_CLIMATE_TEMP_CMD:
-            # Climate temp set
-            temp = int(float(payload))
-            do_smart(temp)
+            # Climate temp set - always do ON first, then SMART
+            _temp = int(float(payload))
+            log.info(f"Temp command received: {_temp}F")
+            shadow = get_shadow()
+            at = float(shadow["state"]["reported"]["AT"])
+            if _temp <= at:
+                _temp = int(at) + 2
+                log.info(f"Temp adjusted to {_temp}F (was below ambient {at}F)")
+            do_on()
+            do_smart(_temp)
     except Exception as e:
         log.error(f"Command failed: {e}")
 
