@@ -1,30 +1,33 @@
-import boto3, json, time, threading
+import boto3, json, time, threading, os
 from flask import Flask, jsonify, request
 from pycognito import Cognito
 from awsiot import mqtt_connection_builder
 from awscrt import mqtt as awsmqtt, auth
 import paho.mqtt.client as paho_mqtt
+from dotenv import load_dotenv
 import logging
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("iflame")
 
-# ── AWS Config ──
-POOL_ID = "us-east-1_xCzWPPECR"
-CLIENT_ID = "REDACTED"
-CLIENT_SECRET = "REDACTED"
-IDENTITY_POOL = "REDACTED"
-IOT_EP = "REDACTED"
-R = "us-east-1"
-THING = "RFF-10FDC28"
-EMAIL = "REDACTED"
-IFLAME_PW = "REDACTED"
+# ── AWS Config (from .env) ──
+POOL_ID = os.environ["COGNITO_POOL_ID"]
+CLIENT_ID = os.environ["COGNITO_CLIENT_ID"]
+CLIENT_SECRET = os.environ["COGNITO_CLIENT_SECRET"]
+IDENTITY_POOL = os.environ["COGNITO_IDENTITY_POOL"]
+IOT_EP = os.environ["IOT_ENDPOINT"]
+R = os.environ.get("AWS_REGION", "us-east-1")
+THING = os.environ["IOT_THING_NAME"]
+EMAIL = os.environ["IFLAME_EMAIL"]
+IFLAME_PW = os.environ["IFLAME_PASSWORD"]
 
-# ── HA MQTT Config ──
-HA_MQTT_HOST = "192.168.42.5"
-HA_MQTT_PORT = 1883
-HA_MQTT_USER = "REDACTED"
-HA_MQTT_PASS = "REDACTED_MQTT"
+# ── HA MQTT Config (from .env) ──
+HA_MQTT_HOST = os.environ.get("HA_MQTT_HOST", "192.168.42.5")
+HA_MQTT_PORT = int(os.environ.get("HA_MQTT_PORT", "1883"))
+HA_MQTT_USER = os.environ["HA_MQTT_USER"]
+HA_MQTT_PASS = os.environ["HA_MQTT_PASS"]
 TOPIC_STATE = "fireplace/status"
 TOPIC_CMD = "fireplace/set"
 TOPIC_AVAIL = "fireplace/available"
